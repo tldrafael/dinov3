@@ -11,7 +11,17 @@ import torch
 import torch.nn.init
 from torch import Tensor, nn
 
-from dinov3.layers import LayerScale, Mlp, PatchEmbed, RMSNorm, RopePositionEmbedding, SelfAttentionBlock, SwiGLUFFN
+from dinov3.layers import (
+    LayerScale,
+    Mlp,
+    PatchEmbed,
+    RMSNorm,
+    RopePositionEmbedding,
+    SelfAttentionBlock,
+    SwiGLUFFN,
+    WindowSelfAttention,
+    SelfAttention,
+)
 from dinov3.utils import named_apply
 
 logger = logging.getLogger("dinov3")
@@ -87,6 +97,8 @@ class DinoVisionTransformer(nn.Module):
         untie_cls_and_patch_norms: bool = False,
         untie_global_and_local_cls_norm: bool = False,
         device: Any | None = None,
+        window_size: int | Tuple[int, int] | None = None,
+        global_attn_indexes: Optional[Sequence[int]] = None,
         **ignored_kwargs,
     ):
         super().__init__()
@@ -100,6 +112,22 @@ class DinoVisionTransformer(nn.Module):
         self.n_blocks = depth
         self.num_heads = num_heads
         self.patch_size = patch_size
+        self.window_size = window_size
+        self.global_attn_indexes = set(global_attn_indexes or [])
+        if isinstance(self.window_size, int):
+            self.window_size = (self.window_size, self.window_size)
+        if self.window_size is not None:
+            if any(idx < 0 or idx >= depth for idx in self.global_attn_indexes):
+                raise ValueError("global_attn_indexes must be within [0, depth)")
+            if self.global_attn_indexes:
+                logger.info(
+                    f"using window attention with window size {self.window_size}; "
+                    f"global attention on blocks {sorted(self.global_attn_indexes)}"
+                )
+            else:
+                logger.info(f"using window attention with window size {self.window_size} on all blocks")
+        elif self.global_attn_indexes:
+            logger.warning("global_attn_indexes ignored because window_size is None")
 
         self.patch_embed = PatchEmbed(
             img_size=img_size,
@@ -152,6 +180,9 @@ class DinoVisionTransformer(nn.Module):
                 init_values=layerscale_init,
                 mask_k_bias=mask_k_bias,
                 device=device,
+                attn_class=partial(WindowSelfAttention, window_size=self.window_size)
+                if (self.window_size is not None and i not in self.global_attn_indexes)
+                else SelfAttention,
             )
             for i in range(depth)
         ]
@@ -221,16 +252,19 @@ class DinoVisionTransformer(nn.Module):
 
     def forward_features_list(self, x_list: List[Tensor], masks_list: List[Tensor]) -> List[Dict[str, Tensor]]:
         x = []
-        rope = []
+        hw_list = []
         for t_x, t_masks in zip(x_list, masks_list):
             t2_x, hw_tuple = self.prepare_tokens_with_masks(t_x, t_masks)
             x.append(t2_x)
-            rope.append(hw_tuple)
+            hw_list.append(hw_tuple)
         for _, blk in enumerate(self.blocks):
             if self.rope_embed is not None:
-                rope_sincos = [self.rope_embed(H=H, W=W) for H, W in rope]
+                rope_sincos = []
+                for H, W in hw_list:
+                    sin, cos = self.rope_embed(H=H, W=W)
+                    rope_sincos.append((sin, cos, H, W))
             else:
-                rope_sincos = [None for r in rope]
+                rope_sincos = [(None, None, H, W) for H, W in hw_list]
             x = blk(x, rope_sincos)
         all_x = x
         output = []
@@ -273,9 +307,10 @@ class DinoVisionTransformer(nn.Module):
         blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
         for i, blk in enumerate(self.blocks):
             if self.rope_embed is not None:
-                rope_sincos = self.rope_embed(H=H, W=W)
+                sin, cos = self.rope_embed(H=H, W=W)
+                rope_sincos = (sin, cos, H, W)
             else:
-                rope_sincos = None
+                rope_sincos = (None, None, H, W)
             x = blk(x, rope_sincos)
             if i in blocks_to_take:
                 output.append(x)

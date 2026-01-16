@@ -64,10 +64,15 @@ class SelfAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def apply_rope(self, q: Tensor, k: Tensor, rope: Tensor | Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
+        if rope is None:
+            return q, k
+        # Accept tuples with extra metadata (e.g., spatial shapes) and gracefully handle missing RoPE values.
+        sin, cos, *rest = rope  # noqa: F841
+        if sin is None or cos is None:
+            return q, k
         # All operations will use the dtype of rope, the output is cast back to the dtype of q and k
         q_dtype = q.dtype
         k_dtype = k.dtype
-        sin, cos = rope
         rope_dtype = sin.dtype
         q = q.to(dtype=rope_dtype)
         k = k.to(dtype=rope_dtype)
@@ -116,6 +121,130 @@ class SelfAttention(nn.Module):
         x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         x = x.transpose(1, 2)
         return x.reshape([B, N, C])
+
+
+class WindowSelfAttention(SelfAttention):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = False,
+        proj_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        mask_k_bias: bool = False,
+        window_size: int | Tuple[int, int] = 14,
+        device=None,
+    ) -> None:
+        super().__init__(
+            dim=dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            proj_bias=proj_bias,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            mask_k_bias=mask_k_bias,
+            device=device,
+        )
+        if isinstance(window_size, int):
+            window_size = (window_size, window_size)
+        self.window_size: Tuple[int, int] = window_size
+
+    def compute_attention(self, qkv: Tensor, attn_bias=None, rope=None) -> Tensor:
+        assert attn_bias is None
+        B, N, _ = qkv.shape
+        C = self.qkv.in_features
+
+        qkv = qkv.reshape(B, N, 3, self.num_heads, C // self.num_heads)
+        q, k, v = torch.unbind(qkv, 2)
+        q, k, v = [t.transpose(1, 2) for t in [q, k, v]]  # [B, H, N, D]
+
+        sin = cos = None
+        H = W = None
+        if rope is not None:
+            sin, cos, *meta = rope
+            if sin is not None and cos is not None:
+                q, k = self.apply_rope(q, k, (sin, cos))
+            if len(meta) >= 2:
+                H, W = meta[:2]
+        if sin is not None:
+            patch_tokens = sin.shape[-2]
+        elif H is not None and W is not None:
+            patch_tokens = H * W
+        else:
+            patch_tokens = N
+
+        prefix_tokens = max(N - patch_tokens, 0)
+        patch_tokens = N - prefix_tokens
+        if H is None or W is None:
+            H = int(math.sqrt(patch_tokens))
+            W = patch_tokens // max(H, 1)
+        window_h, window_w = self.window_size
+
+        q_prefix = q[:, :, :prefix_tokens, :]
+        k_prefix = k[:, :, :prefix_tokens, :]
+        v_prefix = v[:, :, :prefix_tokens, :]
+
+        q_patches = q[:, :, prefix_tokens:, :].reshape(B, self.num_heads, H, W, C // self.num_heads)
+        k_patches = k[:, :, prefix_tokens:, :].reshape(B, self.num_heads, H, W, C // self.num_heads)
+        v_patches = v[:, :, prefix_tokens:, :].reshape(B, self.num_heads, H, W, C // self.num_heads)
+
+        pad_h = (window_h - H % window_h) % window_h
+        pad_w = (window_w - W % window_w) % window_w
+        q_padded = F.pad(q_patches, (0, 0, 0, pad_w, 0, pad_h))
+        k_padded = F.pad(k_patches, (0, 0, 0, pad_w, 0, pad_h))
+        v_padded = F.pad(v_patches, (0, 0, 0, pad_w, 0, pad_h))
+
+        H_pad = H + pad_h
+        W_pad = W + pad_w
+        num_windows_h = H_pad // window_h
+        num_windows_w = W_pad // window_w
+        num_windows = num_windows_h * num_windows_w
+
+        def reshape_to_windows(t: Tensor) -> Tensor:
+            t = t.view(B, self.num_heads, num_windows_h, window_h, num_windows_w, window_w, -1)
+            t = t.permute(0, 2, 4, 1, 3, 5, 6).reshape(B * num_windows, self.num_heads, window_h * window_w, -1)
+            return t
+
+        q_windows = reshape_to_windows(q_padded)
+        k_windows = reshape_to_windows(k_padded)
+        v_windows = reshape_to_windows(v_padded)
+
+        if prefix_tokens > 0:
+            k_prefix_expanded = (
+                k_prefix[:, :, None, :, :]
+                .expand(-1, -1, num_windows, -1, -1)
+                .reshape(B * num_windows, self.num_heads, prefix_tokens, -1)
+            )
+            v_prefix_expanded = (
+                v_prefix[:, :, None, :, :]
+                .expand(-1, -1, num_windows, -1, -1)
+                .reshape(B * num_windows, self.num_heads, prefix_tokens, -1)
+            )
+            k_windows = torch.cat([k_prefix_expanded, k_windows], dim=2)
+            v_windows = torch.cat([v_prefix_expanded, v_windows], dim=2)
+
+        attn_windows = torch.nn.functional.scaled_dot_product_attention(q_windows, k_windows, v_windows)
+        attn_windows = attn_windows.view(B, num_windows_h, num_windows_w, self.num_heads, window_h, window_w, -1)
+        attn_windows = attn_windows.permute(0, 3, 1, 4, 2, 5, 6).reshape(B, self.num_heads, H_pad, W_pad, -1)
+        attn_patches = attn_windows[:, :, :H, :W, :].reshape(B, self.num_heads, H * W, -1)
+
+        if prefix_tokens > 0:
+            kv_global = torch.cat(
+                [k_prefix, k_patches.reshape(B, self.num_heads, H * W, -1)],
+                dim=2,
+            )
+            vv_global = torch.cat(
+                [v_prefix, v_patches.reshape(B, self.num_heads, H * W, -1)],
+                dim=2,
+            )
+            out_prefix = torch.nn.functional.scaled_dot_product_attention(q_prefix, kv_global, vv_global)
+            out = torch.cat([out_prefix, attn_patches], dim=2)
+        else:
+            out = attn_patches
+
+        out = out.transpose(1, 2)
+        return out.reshape([B, N, C])
 
 
 class CausalSelfAttention(nn.Module):

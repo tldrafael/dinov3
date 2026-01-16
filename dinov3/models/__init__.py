@@ -54,6 +54,8 @@ def build_model(args, only_teacher=False, img_size=224, device=None):
             mask_k_bias=args.mask_k_bias,
             untie_cls_and_patch_norms=args.untie_cls_and_patch_norms,
             untie_global_and_local_cls_norm=args.untie_global_and_local_cls_norm,
+            window_size=getattr(args, "window_size", None),
+            global_attn_indexes=getattr(args, "global_attn_indexes", None),
             device=device,
         )
         teacher = vits.__dict__[args.arch](**vit_kwargs)

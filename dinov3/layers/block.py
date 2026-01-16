@@ -72,14 +72,19 @@ class SelfAttentionBlock(nn.Module):
         if rope is None:
             return None
 
-        sin, cos = rope
+        sin, cos, *rest = rope
+        if sin is None or cos is None:
+            return rope
         assert sin.ndim == cos.ndim
         if sin.ndim == 4:
             # If the rope embedding has a batch dimension (is different for each batch element), index into it
-            return sin[indices], cos[indices]  # [batch, heads, patches, embed_dim]
+            sin = sin[indices]
+            cos = cos[indices]  # [batch, heads, patches, embed_dim]
         else:
             # No batch dimension, do not index
-            return sin, cos  # [heads, patches, embed_dim] or [patches, embed_dim]
+            sin = sin
+            cos = cos  # [heads, patches, embed_dim] or [patches, embed_dim]
+        return (sin, cos, *rest)
 
     def _forward(self, x: Tensor, rope=None) -> Tensor:
         """
